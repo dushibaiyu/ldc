@@ -26,6 +26,11 @@
 // FIXME: Just for the BOUDNSCHECK enum; this is not pretty
 #include "globals.h"
 
+namespace llvm {
+class FastMathFlags;
+class TargetMachine;
+}
+
 namespace opts {
 namespace cl = llvm::cl;
 
@@ -39,8 +44,9 @@ extern llvm::SmallVector<const char *, 32> allArguments;
  */
 extern cl::list<std::string> fileList;
 extern cl::list<std::string> runargs;
+extern cl::opt<bool> invokedByLDMD;
 extern cl::opt<bool> compileOnly;
-extern cl::opt<bool, true> enforcePropertySyntax;
+extern cl::opt<bool> useDIP1000;
 extern cl::opt<bool> noAsm;
 extern cl::opt<bool> dontWriteObj;
 extern cl::opt<std::string> objectFile;
@@ -50,16 +56,18 @@ extern cl::opt<bool> output_bc;
 extern cl::opt<bool> output_ll;
 extern cl::opt<bool> output_s;
 extern cl::opt<cl::boolOrDefault> output_o;
-extern cl::opt<bool, true> disableRedZone;
 extern cl::opt<std::string> ddocDir;
 extern cl::opt<std::string> ddocFile;
 extern cl::opt<std::string> jsonFile;
 extern cl::opt<std::string> hdrDir;
 extern cl::opt<std::string> hdrFile;
+extern cl::opt<bool> hdrKeepAllBodies;
 extern cl::list<std::string> versions;
 extern cl::list<std::string> transitions;
 extern cl::opt<std::string> moduleDeps;
 extern cl::opt<std::string> cacheDir;
+extern cl::list<std::string> linkerSwitches;
+extern cl::list<std::string> ccSwitches;
 
 extern cl::opt<std::string> mArch;
 extern cl::opt<bool> m32bits;
@@ -74,14 +82,16 @@ extern cl::opt<llvm::Reloc::Model> mRelocModel;
 extern cl::opt<llvm::CodeModel::Model> mCodeModel;
 extern cl::opt<bool> disableFpElim;
 extern cl::opt<FloatABI::Type> mFloatABI;
-extern cl::opt<bool, true> singleObj;
 extern cl::opt<bool> linkonceTemplates;
 extern cl::opt<bool> disableLinkerStripDead;
 
+// Math options
+extern bool fFastMath;
+extern llvm::FastMathFlags defaultFMF;
+void setDefaultMathOptions(llvm::TargetMachine &target);
+
 extern cl::opt<BOUNDSCHECK> boundsCheck;
 extern bool nonSafeBoundsChecks;
-
-extern cl::opt<unsigned, true> nestedTemplateDepth;
 
 #if LDC_WITH_PGO
 extern cl::opt<std::string> genfileInstrProf;
@@ -93,9 +103,8 @@ extern cl::opt<bool> instrumentFunctions;
 extern std::vector<std::string> debugArgs;
 // Arguments to -run
 
-#if LDC_LLVM_VER >= 307
-void CreateColorOption();
-#endif
+void createClashingOptions();
+void hideLLVMOptions();
 
 #if LDC_LLVM_VER >= 309
 // LTO options
@@ -110,6 +119,10 @@ inline bool isUsingThinLTO() { return ltoMode == LTO_Thin; }
 #else
 inline bool isUsingLTO() { return false; }
 inline bool isUsingThinLTO() { return false; }
+#endif
+
+#if LDC_LLVM_VER >= 400
+extern cl::opt<std::string> saveOptimizationRecord;
 #endif
 }
 #endif

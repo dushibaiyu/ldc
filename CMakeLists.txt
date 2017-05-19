@@ -3,14 +3,11 @@ project(ldc)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/Modules")
 
-if(MSVC)
-    set(LIBCONFIG_DLL OFF CACHE BOOL "Use libconfig DLL instead of static library")
-endif()
-
 include(FindDCompiler)
 include(CheckIncludeFile)
 include(CheckLibraryExists)
 include(CheckCXXCompilerFlag)
+include(CheckDSourceCompiles)
 
 # The script currently only supports the DMD-style commandline interface
 if (NOT D_COMPILER_DMD_COMPAT)
@@ -22,16 +19,11 @@ endif()
 #
 
 find_package(LLVM 3.5 REQUIRED
-    all-targets analysis asmparser asmprinter bitreader bitwriter codegen core debuginfocodeview debuginfodwarf debuginfomsf debuginfopdb globalisel instcombine ipa ipo instrumentation irreader linker lto mc mcdisassembler mcparser objcarcopts object option profiledata scalaropts selectiondag support tablegen target transformutils vectorize ${EXTRA_LLVM_MODULES})
+    all-targets analysis asmparser asmprinter bitreader bitwriter codegen core debuginfocodeview debuginfodwarf debuginfomsf debuginfopdb globalisel instcombine ipa ipo instrumentation irreader libdriver linker lto mc mcdisassembler mcparser objcarcopts object option profiledata scalaropts selectiondag support tablegen target transformutils vectorize ${EXTRA_LLVM_MODULES})
 math(EXPR LDC_LLVM_VER ${LLVM_VERSION_MAJOR}*100+${LLVM_VERSION_MINOR})
 # Remove LLVMTableGen library from list of libraries
 string(REGEX MATCH "^-.*LLVMTableGen[^;]*;|;-.*LLVMTableGen[^;]*" LLVM_TABLEGEN_LIBRARY "${LLVM_LIBRARIES}")
 string(REGEX REPLACE "^-.*LLVMTableGen[^;]*;|;-.*LLVMTableGen[^;]*" "" LLVM_LIBRARIES "${LLVM_LIBRARIES}")
-
-#
-# Locate libconfig.
-#
-find_package(LibConfig REQUIRED)
 
 #
 # Get info about used Linux distribution.
@@ -54,10 +46,10 @@ endfunction()
 #
 
 # Version information
-set(LDC_VERSION "1.1.0") # May be overridden by git hash tag
+set(LDC_VERSION "1.3.0") # May be overridden by git hash tag
 set(DMDFE_MAJOR_VERSION   2)
 set(DMDFE_MINOR_VERSION   0)
-set(DMDFE_PATCH_VERSION   71)
+set(DMDFE_PATCH_VERSION   73)
 set(DMDFE_FIX_LEVEL       2) # Comment out if not used
 
 set(DMD_VERSION ${DMDFE_MAJOR_VERSION}.${DMDFE_MINOR_VERSION}${DMDFE_PATCH_VERSION})
@@ -79,6 +71,9 @@ set(D_VERSION ${DMDFE_MAJOR_VERSION} CACHE STRING "D language version")
 set(PROGRAM_PREFIX "" CACHE STRING "Prepended to ldc/ldmd binary names")
 set(PROGRAM_SUFFIX "" CACHE STRING "Appended to ldc/ldmd binary names")
 set(CONF_INST_DIR ${SYSCONF_INSTALL_DIR} CACHE PATH "Directory ldc.conf is installed to")
+
+# Note: LIB_SUFFIX should perhaps be renamed to LDC_LIBDIR_SUFFIX.
+set(LIB_SUFFIX "" CACHE STRING "Appended to the library installation directory. Set to '64' to install libraries into ${PREFIX}/lib64.")
 
 # The following flags are currently not well tested, expect the build to fail.
 option(GENERATE_OFFTI "generate complete ClassInfo.offTi arrays")
@@ -146,24 +141,19 @@ if(MSVC)
         endif()
     endif()
 
-    # LDC and LDMD are both linked against the dynamic MSVC runtime by
-    # default (due to default CMAKE_C[XX]_FLAGS_*).
-    # Host DMD/LDMD will default to linking against the static MSVC runtime.
-    # So disable some default libs based on CMAKE_C_FLAGS_RELEASE.
-    if(CMAKE_C_FLAGS_RELEASE MATCHES "(^| )[/-]MD( |$)")
-        append("-L/NODEFAULTLIB:libcmt" DDMD_LFLAGS)
-        if(MSVC_VERSION GREATER 1800) # VS 2015+
-            append("-L/NODEFAULTLIB:libvcruntime" DDMD_LFLAGS)
-        endif()
-    else()
-        append("-L/NODEFAULTLIB:msvcrt" DDMD_LFLAGS)
-        if(MSVC_VERSION GREATER 1800) # VS 2015+
-            append("-L/NODEFAULTLIB:vcruntime" DDMD_LFLAGS)
-        endif()
-    endif()
+    # Link against the static MSVC runtime; CMake's C(++) flags apparently default to the dynamic one.
+    # Host DMD/LDMD already defaults to linking against the static MSVC runtime.
+    # NOTE: Requires LLVM to be built with CMake variable LLVM_USE_CRT_{RELEASE,DEBUG,...}=MT[d].
+    foreach(flag_var
+            CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE CMAKE_C_FLAGS_MINSIZEREL CMAKE_C_FLAGS_RELWITHDEBINFO
+            CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO)
+       if(${flag_var} MATCHES "/MD")
+          string(REGEX REPLACE "/MD" "/MT" ${flag_var} "${${flag_var}}")
+       endif()
+    endforeach()
 endif()
 
-append("-J${PROJECT_SOURCE_DIR}/${DDMDFE_PATH}" DDMD_DFLAGS) # Needed for importing text files
+append("-J${PROJECT_SOURCE_DIR}/${DDMDFE_PATH} -J${PROJECT_SOURCE_DIR}/res" DDMD_DFLAGS) # Needed for importing text files
 string(STRIP "${DDMD_DFLAGS}" DDMD_DFLAGS)
 
 # Use separate compiler flags for the frontend and for the LDC-specific parts,
@@ -307,7 +297,7 @@ if(NOT TAG MATCHES "NOTFOUND")
         set(LDC_VERSION "${TAG}")
     endif()
 else()
-    get_git_head_revision(REFSPEC HASH)
+    get_git_head_revision(REFSPEC HASH FALSE)
     if(NOT HASH STREQUAL "GITDIR-NOTFOUND")
         # Append git hash to LDC_VERSION
         string(SUBSTRING "${HASH}" 0 7 LDC_VERSION_HASH)
@@ -327,6 +317,7 @@ configure_file(driver/ldc-version.cpp.in driver/ldc-version.cpp)
 # project files generated via CMake.
 file(GLOB_RECURSE FE_SRC_D ${DDMDFE_PATH}/*.d)
 file(GLOB_RECURSE FE_HDR   ${DDMDFE_PATH}/*.h)
+file(GLOB_RECURSE FE_RES   res/*.*)
 file(GLOB_RECURSE GEN_SRC gen/*.cpp)
 file(GLOB_RECURSE GEN_HDR gen/*.h)
 file(GLOB_RECURSE GEN_SRC_D gen/*.d)
@@ -343,6 +334,7 @@ set(DRV_SRC
     driver/targetmachine.cpp
     driver/toobj.cpp
     driver/tool.cpp
+    driver/archiver.cpp
     driver/linker.cpp
     driver/main.cpp
     ${CMAKE_BINARY_DIR}/driver/ldc-version.cpp
@@ -355,6 +347,7 @@ set(DRV_HDR
     driver/configfile.h
     driver/exe_path.h
     driver/ldc-version.h
+    driver/archiver.h
     driver/linker.h
     driver/targetmachine.h
     driver/toobj.h
@@ -395,13 +388,18 @@ source_group("Generated Files" REGULAR_EXPRESSION "(id\\.[cdh]|impcnvtab\\.c)$")
 
 
 #
+# Configure the build system to use LTO and/or PGO while building LDC
+#
+include(HandleLTOPGOBuildOptions)
+
+#
 # Enable PGO if supported for this platform and LLVM version.
 # LLVM >= 3.7 is required for PGO.
 #
 set(LDC_WITH_PGO False)  # must be a valid Python boolean constant (case sensitive)
 if (NOT (LDC_LLVM_VER LESS 307))
     message(STATUS "Building LDC with PGO support")
-    add_definitions(-DLDC_WITH_PGO)
+    append("-DLDC_WITH_PGO" LDC_CXXFLAGS)
     set(LDC_WITH_PGO True)
 endif()
 
@@ -418,7 +416,6 @@ include_directories(
 )
 include_directories( SYSTEM
     ${LLVM_INCLUDE_DIRS}
-    ${LIBCONFIG_INCLUDE_DIR}
 )
 append("-I${PROJECT_SOURCE_DIR}" DDMD_DFLAGS)
 append("-I${PROJECT_BINARY_DIR}" DDMD_DFLAGS)
@@ -426,22 +423,30 @@ append("-I${PROJECT_BINARY_DIR}" DDMD_DFLAGS)
 
 if(MSVC)
     include_directories(${PROJECT_SOURCE_DIR}/vcbuild)
-    if(NOT LIBCONFIG_DLL)
-        append("-DLIBCONFIG_STATIC" CMAKE_CXX_FLAGS)
-    endif()
 endif()
 
 if(MSVC)
     append("-version=IN_LLVM_MSVC" DDMD_DFLAGS)
 endif()
 append("-version=IN_LLVM" DDMD_DFLAGS)
-append("-DIN_LLVM" CMAKE_CXX_FLAGS)
-append("-DOPAQUE_VTBLS" CMAKE_CXX_FLAGS)
-append("-DLDC_INSTALL_PREFIX=\"${CMAKE_INSTALL_PREFIX}\"" CMAKE_CXX_FLAGS)
-append("-DLDC_LLVM_VER=${LDC_LLVM_VER}" CMAKE_CXX_FLAGS)
+append("-DIN_LLVM" LDC_CXXFLAGS)
+append("-DOPAQUE_VTBLS" LDC_CXXFLAGS)
+append("\"-DLDC_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}\"" LDC_CXXFLAGS)
+append("-DLDC_LLVM_VER=${LDC_LLVM_VER}" LDC_CXXFLAGS)
+append("\"-DLDC_LIBDIR_SUFFIX=\\\"${LIB_SUFFIX}\\\"\"" LDC_CXXFLAGS)
 
 if(GENERATE_OFFTI)
-    append("-DGENERATE_OFFTI" CMAKE_CXX_FLAGS)
+    append("-DGENERATE_OFFTI" LDC_CXXFLAGS)
+endif()
+
+option(RISCV_LLVM_DEV, "full RISC-V support with riscv-llvm")
+mark_as_advanced(RISCV_LLVM_DEV)
+
+#
+# Enable building with riscv-llvm, for full RISC-V support.
+#
+if(RISCV_LLVM_DEV)
+    append("-DRISCV_LLVM_DEV" LDC_CXXFLAGS)
 endif()
 
 # if llvm was built with assertions we have to do the same
@@ -510,8 +515,8 @@ add_library(${LDC_LIB} ${LDC_LIB_TYPE} ${LDC_CXX_SOURCE_FILES} ${DRV_SRC} ${DRV_
 set_target_properties(
     ${LDC_LIB} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin
-    LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib
-    ARCHIVE_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib
+    LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib${LIB_SUFFIX}
+    ARCHIVE_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib${LIB_SUFFIX}
     ARCHIVE_OUTPUT_NAME ldc
     LIBRARY_OUTPUT_NAME ldc
     RUNTIME_OUTPUT_NAME ldc
@@ -532,8 +537,8 @@ add_custom_target(${LDC_EXE} ALL DEPENDS ${LDC_EXE_FULL})
 add_custom_target(${LDMD_EXE} ALL DEPENDS ${LDMD_EXE_FULL})
 
 # Figure out how to link the main LDC executable, for which we need to take the
-# libconfig/LLVM flags into account.
-set(LDC_LINKERFLAG_LIST "${SANITIZE_LDFLAGS};${LIBCONFIG_LIBRARY};${LLVM_LIBRARIES};${LLVM_LDFLAGS}")
+# LLVM flags into account.
+set(LDC_LINKERFLAG_LIST "${SANITIZE_LDFLAGS};${LLVM_LIBRARIES};${LLVM_LDFLAGS}")
 
 set(LDC_LINK_MANUALLY OFF)
 if(UNIX AND (CMAKE_COMPILER_IS_GNUCXX OR (${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang")))
@@ -565,9 +570,8 @@ else()
     # Use D compiler for linking, trying to translate a few common linker flags.
     set(LDC_TRANSLATED_LINKER_FLAGS "")
     foreach(f ${LDC_LINKERFLAG_LIST})
-        string(REPLACE "-Wl," "" f ${f})
         string(REPLACE "-LIBPATH:" "/LIBPATH:" f ${f})
-        append("-L\"${f}\"" LDC_TRANSLATED_LINKER_FLAGS)
+        append("\"-L${f}\"" LDC_TRANSLATED_LINKER_FLAGS)
     endforeach()
 
     if(MSVC)
@@ -602,7 +606,7 @@ function(build_d_executable output_exe compiler_args linker_args compile_deps li
           separate_arguments(lflags WINDOWS_COMMAND "${lflags}")
         endif()
         foreach(f ${linker_args})
-            append("-L\"${f}\"" lflags)
+            append("\"-L${f}\"" lflags)
         endforeach()
         add_custom_command(
             OUTPUT ${output_exe}
@@ -620,14 +624,14 @@ if(MSVC_IDE)
         OUTPUT ${LDC_EXE_FULL}
         COMMAND ${D_COMPILER} -L$<TARGET_LINKER_FILE:${LDC_LIB}> ${LDC_FLAG_LIST} -I${PROJECT_SOURCE_DIR}/${DDMDFE_PATH} -of${LDC_EXE_FULL} ${LDC_D_SOURCE_FILES} $<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:-g> $<$<NOT:$<CONFIG:Debug>>:-O> $<$<NOT:$<CONFIG:Debug>>:-inline> $<$<NOT:$<CONFIG:Debug>>:-release>
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        DEPENDS ${LDC_D_SOURCE_FILES} ${PROJECT_BINARY_DIR}/${DDMDFE_PATH}/id.d ${LDC_LIB}
+        DEPENDS ${LDC_D_SOURCE_FILES} ${FE_RES} ${PROJECT_BINARY_DIR}/${DDMDFE_PATH}/id.d ${LDC_LIB}
     )
 else()
     build_d_executable(
         "${LDC_EXE_FULL}"
         "${LDC_D_SOURCE_FILES}"
         "$<TARGET_LINKER_FILE:${LDC_LIB}>"
-        "${LDC_D_SOURCE_FILES};${PROJECT_BINARY_DIR}/${DDMDFE_PATH}/id.d"
+        "${LDC_D_SOURCE_FILES};${FE_RES};${PROJECT_BINARY_DIR}/${DDMDFE_PATH}/id.d"
         "${LDC_LIB}"
     )
 endif()
@@ -657,8 +661,8 @@ set_source_files_properties(driver/exe_path.cpp driver/ldmd.cpp driver/response.
 add_library(LDMD_CXX_LIB ${LDC_LIB_TYPE} driver/exe_path.cpp driver/ldmd.cpp driver/response.cpp driver/exe_path.h)
 set_target_properties(
     LDMD_CXX_LIB PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib
-    ARCHIVE_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib
+    LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib${LIB_SUFFIX}
+    ARCHIVE_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib${LIB_SUFFIX}
     ARCHIVE_OUTPUT_NAME ldmd
     LIBRARY_OUTPUT_NAME ldmd
 )
@@ -671,6 +675,29 @@ build_d_executable(
     "LDMD_CXX_LIB;${LDC_LIB}"
 )
 
+#
+# Locate LLVM's LTO binary and use it (LLVM >= 3.9)
+#
+if(APPLE)
+    set(LDC_INSTALL_LTOPLUGIN_DEFAULT ON)
+else()
+    set(LDC_INSTALL_LTOPLUGIN_DEFAULT OFF)
+endif()
+set(LDC_INSTALL_LTOPLUGIN ${LDC_INSTALL_LTOPLUGIN_DEFAULT} CACHE BOOL "Copy/install the LTO plugin from the LLVM package when available (LLVM >= 3.9).")
+if (NOT (LDC_LLVM_VER LESS 309) AND LDC_INSTALL_LTOPLUGIN)
+    if(APPLE)
+        set(LLVM_LTO_BINARY ${LLVM_LIBRARY_DIRS}/libLTO.dylib)
+        set(LDC_LTO_BINARY_NAME libLTO-ldc.dylib)
+    elseif(UNIX)
+        set(LLVM_LTO_BINARY ${LLVM_LIBRARY_DIRS}/LLVMgold.so)
+        set(LDC_LTO_BINARY_NAME LLVMgold-ldc.so)
+    endif()
+    if(EXISTS ${LLVM_LTO_BINARY})
+        message(STATUS "Also installing LTO binary: ${LLVM_LTO_BINARY}")
+        file(MAKE_DIRECTORY ${PROJECT_BINARY_DIR}/lib${LIB_SUFFIX})
+        configure_file(${LLVM_LTO_BINARY} ${PROJECT_BINARY_DIR}/lib${LIB_SUFFIX}/${LDC_LTO_BINARY_NAME} COPYONLY)
+    endif()
+endif()
 
 #
 # Auxiliary build and test utils.
@@ -686,6 +713,21 @@ add_subdirectory(tools)
 # Test and runtime targets. Note that enable_testing() is order-sensitive!
 #
 enable_testing()
+
+# LDC unittest executable (D unittests only).
+set(LDC_UNITTEST_EXE_FULL ${PROJECT_BINARY_DIR}/bin/${LDC_EXE_NAME}-unittest${CMAKE_EXECUTABLE_SUFFIX})
+build_d_executable(
+    "${LDC_UNITTEST_EXE_FULL}"
+    "-unittest;${LDC_D_SOURCE_FILES}"
+    "$<TARGET_LINKER_FILE:${LDC_LIB}>"
+    "${LDC_D_SOURCE_FILES}"
+    "${LDC_LIB}"
+)
+add_custom_target(ldc2-unittest DEPENDS ${LDC_UNITTEST_EXE_FULL})
+add_test(NAME build-ldc2-unittest COMMAND "${CMAKE_COMMAND}" --build ${CMAKE_BINARY_DIR} --target ldc2-unittest)
+add_test(NAME ldc2-unittest COMMAND ${LDC_UNITTEST_EXE_FULL} --version)
+set_tests_properties(ldc2-unittest PROPERTIES DEPENDS build-ldc2-unittest)
+
 add_subdirectory(runtime)
 if(D_VERSION EQUAL 2)
     add_subdirectory(tests/d2)
@@ -702,7 +744,7 @@ if(${BUILD_SHARED})
     # For now, only install libldc if explicitly building the shared library.
     # While it might theoretically be possible to use LDC as a static library
     # as well, for the time being this just bloats the normal packages.
-    install(TARGETS ${LDC_LIB} DESTINATION ${CMAKE_INSTALL_PREFIX}/lib)
+    install(TARGETS ${LDC_LIB} DESTINATION ${CMAKE_INSTALL_PREFIX}/lib${LIB_SUFFIX})
 endif()
 install(FILES ${PROJECT_BINARY_DIR}/bin/${LDC_EXE}_install.conf DESTINATION ${CONF_INST_DIR} RENAME ${LDC_EXE}.conf)
 
@@ -710,9 +752,8 @@ if(MSVC)
     install(DIRECTORY vcbuild/ DESTINATION ${CMAKE_INSTALL_PREFIX}/bin FILES_MATCHING PATTERN "*.bat")
     # Also put the VCBuild scripts in the build/bin folder, so that ${PROJECT_BINARY_DIR}/bin/ldc2 is functional.
     # This is necessary for the IR tests that use ${PROJECT_BINARY_DIR}/bin/ldc2.
-    configure_file(vcbuild/amd64.bat   ${PROJECT_BINARY_DIR}/bin/amd64.bat   COPYONLY)
+    configure_file(vcbuild/dumpEnv.bat ${PROJECT_BINARY_DIR}/bin/dumpEnv.bat COPYONLY)
     configure_file(vcbuild/msvcEnv.bat ${PROJECT_BINARY_DIR}/bin/msvcEnv.bat COPYONLY)
-    configure_file(vcbuild/x86.bat     ${PROJECT_BINARY_DIR}/bin/x86.bat     COPYONLY)
 endif()
 
 if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
@@ -727,16 +768,8 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 endif()
 
 # Also install LLVM's LTO binary if available
-if(APPLE)
-    set(LLVM_LTO_BINARY ${LLVM_LIBRARY_DIRS}/libLTO.dylib)
-elseif(UNIX)
-    set(LLVM_LTO_BINARY ${LLVM_LIBRARY_DIRS}/LLVMgold.so)
-endif()
 if(EXISTS ${LLVM_LTO_BINARY})
-    message(STATUS "Also installing LTO binary: ${LLVM_LTO_BINARY}")
-    install(PROGRAMS ${LLVM_LTO_BINARY} DESTINATION ${CMAKE_INSTALL_PREFIX}/lib)
-    file(MAKE_DIRECTORY ${PROJECT_BINARY_DIR}/lib)
-    configure_file(${LLVM_LTO_BINARY} ${PROJECT_BINARY_DIR}/lib COPYONLY)
+    install(PROGRAMS ${PROJECT_BINARY_DIR}/lib${LIB_SUFFIX}/${LDC_LTO_BINARY_NAME} DESTINATION ${CMAKE_INSTALL_PREFIX}/lib${LIB_SUFFIX})
 endif()
 
 #

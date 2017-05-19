@@ -31,7 +31,6 @@
 #include "gen/logger.h"
 #include "gen/moduleinfo.h"
 #include "gen/optimizer.h"
-#include "gen/programs.h"
 #include "gen/runtime.h"
 #include "gen/structs.h"
 #include "gen/tollvm.h"
@@ -55,7 +54,7 @@
 #endif
 
 static llvm::cl::opt<bool, true>
-    preservePaths("op", llvm::cl::desc("Do not strip paths from source file"),
+    preservePaths("op", llvm::cl::desc("Preserve source path for output files"),
                   llvm::cl::ZeroOrMore,
                   llvm::cl::location(global.params.preservePaths));
 
@@ -557,12 +556,15 @@ void addCoverageAnalysis(Module *m) {
   // size_t[] valid, uint[] data, ubyte minPercent)
   // Build ctor name
   LLFunction *ctor = nullptr;
-  std::string ctorname = "_D";
-  ctorname += mangle(m);
-  ctorname += "12_coverageanalysisCtor1FZv";
+
+  OutBuffer mangleBuf;
+  mangleBuf.writestring("_D");
+  mangleToBuffer(m, &mangleBuf);
+  mangleBuf.writestring("12_coverageanalysisCtor1FZv");
+  const char *ctorname = mangleBuf.peekString();
+
   {
-    IF_LOG Logger::println("Build Coverage Analysis constructor: %s",
-                           ctorname.c_str());
+    IF_LOG Logger::println("Build Coverage Analysis constructor: %s", ctorname);
 
     LLFunctionType *ctorTy = LLFunctionType::get(
         LLType::getVoidTy(gIR->context()), std::vector<LLType *>(), false);
@@ -597,12 +599,12 @@ void addCoverageAnalysis(Module *m) {
   // hack.
   {
     IF_LOG Logger::println("Add %s to module's shared static constructor list",
-                           ctorname.c_str());
+                           ctorname);
     FuncDeclaration *fd =
-        FuncDeclaration::genCfunc(nullptr, Type::tvoid, ctorname.c_str());
+        FuncDeclaration::genCfunc(nullptr, Type::tvoid, ctorname);
     fd->linkage = LINKd;
     IrFunction *irfunc = getIrFunc(fd, true);
-    irfunc->func = ctor;
+    irfunc->setLLVMFunc(ctor);
     getIrModule(m)->sharedCtors.push_back(fd);
   }
 
@@ -680,12 +682,17 @@ void loadInstrProfileData(IRState *irs) {
 void registerModuleInfo(Module *m) {
   const auto moduleInfoSym = genModuleInfo(m);
   const auto style = getModuleRegistryStyle();
+
+  OutBuffer mangleBuf;
+  mangleToBuffer(m, &mangleBuf);
+  const char *mangle = mangleBuf.peekString();
+
   if (style == RegistryStyle::legacyLinkedList) {
     const auto miCtor =
-        build_module_reference_and_ctor(mangle(m), moduleInfoSym);
+        build_module_reference_and_ctor(mangle, moduleInfoSym);
     AppendFunctionToLLVMGlobalCtorsDtors(miCtor, 65535, true);
   } else {
-    emitModuleRefToSection(style, mangle(m), moduleInfoSym);
+    emitModuleRefToSection(style, mangle, moduleInfoSym);
   }
 }
 }
@@ -722,8 +729,8 @@ void codegenModule(IRState *irs, Module *m) {
   }
 
   // Skip emission of all the additional module metadata if requested by the
-  // user.
-  if (!m->noModuleInfo) {
+  // user or the betterC switch is on.
+  if (!global.params.betterC && !m->noModuleInfo) {
     // generate ModuleInfo
     registerModuleInfo(m);
   }

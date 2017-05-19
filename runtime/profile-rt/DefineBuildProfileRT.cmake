@@ -12,10 +12,10 @@ if (LDC_WITH_PGO)
         # Omit Default Library Name from the library, so it will work with both release and debug builds
         set(PROFRT_EXTRA_FLAGS "/Zl")
 
-        # Add library needed for `gethostname`
-        set(PROFRT_EXTRA_LDFLAGS "Ws2_32.lib")
-    else()
-        set(PROFRT_EXTRA_FLAGS "-fPIC -O3")
+        # Add library needed for `gethostname` (LLVM <= 3.9)
+        if (NOT (LDC_LLVM_VER GREATER 309))
+            set(PROFRT_EXTRA_LDFLAGS "Ws2_32.lib")
+        endif()
     endif()
 
     CHECK_CXX_SOURCE_COMPILES("
@@ -68,16 +68,10 @@ if (LDC_WITH_PGO)
     macro(compile_profilert_D d_flags lib_suffix path_suffix outlist_o outlist_bc)
         get_target_suffix("${lib_suffix}" "${path_suffix}" target_suffix)
 
-        if(BUILD_SHARED_LIBS)
-            set(shared ";-d-version=Shared")
-        else()
-            set(shared)
-        endif()
-
         foreach(f ${LDC_PROFRT_D})
             dc(
                 ${f}
-                "${d_flags}${shared}"
+                "${d_flags}"
                 "${PROFILERT_DIR}"
                 "${target_suffix}"
                 ${outlist_o}
@@ -86,19 +80,17 @@ if (LDC_WITH_PGO)
         endforeach()
     endmacro()
 
-    macro(build_profile_runtime d_flags c_flags ld_flags path_suffix outlist_targets)
-        get_target_suffix("" "${path_suffix}" target_suffix)
-
+    macro(build_profile_runtime d_flags c_flags ld_flags lib_suffix path_suffix outlist_targets)
         set(output_path ${CMAKE_BINARY_DIR}/lib${path_suffix})
 
         set(profilert_d_o "")
         set(profilert_d_bc "")
-        compile_profilert_D("${d_flags}" "" "${path_suffix}" profilert_d_o profilert_d_bc)
+        compile_profilert_D("${d_flags};-relocation-model=pic" "${lib_suffix}" "${path_suffix}" profilert_d_o profilert_d_bc)
 
         add_library(ldc-profile-rt${target_suffix} STATIC ${profilert_d_o} ${LDC_PROFRT_C} ${LDC_PROFRT_CXX})
         set_target_properties(
             ldc-profile-rt${target_suffix} PROPERTIES
-            OUTPUT_NAME                 ldc-profile-rt
+            OUTPUT_NAME                 ldc-profile-rt${lib_suffix}
             VERSION                     ${LDC_VERSION}
             LINKER_LANGUAGE             C
             ARCHIVE_OUTPUT_DIRECTORY    ${output_path}
@@ -113,9 +105,4 @@ if (LDC_WITH_PGO)
 
     # Install D interface files to profile-rt.
     install(DIRECTORY ${PROFILERT_DIR}/d/ldc DESTINATION ${INCLUDE_INSTALL_DIR} FILES_MATCHING PATTERN "*.d")
-
-else()
-    # No profiling supported, define NOP macro
-    macro(build_profile_runtime c_flags ld_flags path_suffix outlist_targets)
-    endmacro()
 endif()

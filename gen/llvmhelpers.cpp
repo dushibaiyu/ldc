@@ -180,15 +180,24 @@ llvm::AllocaInst *DtoAlloca(VarDeclaration *vd, const char *name) {
 llvm::AllocaInst *DtoArrayAlloca(Type *type, unsigned arraysize,
                                  const char *name) {
   LLType *lltype = DtoType(type);
-  auto ai = new llvm::AllocaInst(lltype, DtoConstUint(arraysize), name,
-                                 gIR->topallocapoint());
+  auto ai = new llvm::AllocaInst(
+      lltype,
+#if LDC_LLVM_VER >= 500
+      gIR->module.getDataLayout().getAllocaAddrSpace(),
+#endif
+      DtoConstUint(arraysize), name, gIR->topallocapoint());
   ai->setAlignment(DtoAlignment(type));
   return ai;
 }
 
 llvm::AllocaInst *DtoRawAlloca(LLType *lltype, size_t alignment,
                                const char *name) {
-  auto ai = new llvm::AllocaInst(lltype, name, gIR->topallocapoint());
+  auto ai =
+      new llvm::AllocaInst(lltype,
+#if LDC_LLVM_VER >= 500
+                           gIR->module.getDataLayout().getAllocaAddrSpace(),
+#endif
+                           name, gIR->topallocapoint());
   if (alignment) {
     ai->setAlignment(alignment);
   }
@@ -727,8 +736,12 @@ DValue *DtoPaintType(Loc &loc, DValue *val, Type *to) {
     LLValue *ptr = DtoBitCast(DtoRVal(val), DtoType(b));
     return new DImValue(to, ptr);
   }
-  // assert(!val->isLVal()); TODO: what is it needed for?
-  assert(DtoType(to) == DtoType(to));
+  if (from->ty == Tsarray) {
+    assert(to->toBasetype()->ty == Tsarray);
+    LLValue *ptr = DtoBitCast(DtoLVal(val), DtoPtrToType(to));
+    return new DLValue(to, ptr);
+  }
+  assert(DtoType(from) == DtoType(to));
   return new DImValue(to, DtoRVal(val));
 }
 
@@ -1383,7 +1396,7 @@ void callPostblit(Loc &loc, Expression *exp, LLValue *val) {
       }
       DtoResolveFunction(fd);
       Expressions args;
-      DFuncValue dfn(fd, getIrFunc(fd)->func, val);
+      DFuncValue dfn(fd, DtoCallee(fd), val);
       DtoCallFunction(loc, Type::basic[Tvoid], &dfn, &args);
     }
   }
@@ -1392,7 +1405,7 @@ void callPostblit(Loc &loc, Expression *exp, LLValue *val) {
 ////////////////////////////////////////////////////////////////////////////////
 
 bool isSpecialRefVar(VarDeclaration *vd) {
-  return (vd->storage_class & STCref) && (vd->storage_class & STCforeach);
+  return (vd->storage_class & (STCref | STCparameter)) == STCref;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1588,9 +1601,9 @@ DValue *DtoSymbolAddress(Loc &loc, Type *type, Declaration *decl) {
     // We need to codegen the function here, because literals are not added
     // to the module member list.
     DtoDefineFunction(flitdecl);
-    assert(getIrFunc(flitdecl)->func);
+    assert(DtoCallee(flitdecl));
 
-    return new DFuncValue(flitdecl, getIrFunc(flitdecl)->func);
+    return new DFuncValue(flitdecl, DtoCallee(flitdecl));
   }
 
   if (FuncDeclaration *fdecl = decl->isFuncDeclaration()) {
@@ -1607,7 +1620,7 @@ DValue *DtoSymbolAddress(Loc &loc, Type *type, Declaration *decl) {
     }
     DtoResolveFunction(fdecl);
     return new DFuncValue(fdecl, fdecl->llvmInternal != LLVMva_arg
-                                     ? getIrFunc(fdecl)->func
+                                     ? DtoCallee(fdecl)
                                      : nullptr);
   }
 
@@ -1661,7 +1674,7 @@ llvm::Constant *DtoConstSymbolAddress(Loc &loc, Declaration *decl) {
   // static function
   if (FuncDeclaration *fd = decl->isFuncDeclaration()) {
     DtoResolveFunction(fd);
-    return getIrFunc(fd)->func;
+    return DtoCallee(fd);
   }
 
   llvm_unreachable("Taking constant address not implemented.");

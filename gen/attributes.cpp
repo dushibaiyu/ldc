@@ -66,20 +66,25 @@ AttrSet::AttrSet(const AttrSet &base, unsigned index, LLAttribute attribute)
 
 AttrSet
 AttrSet::extractFunctionAndReturnAttributes(const llvm::Function *function) {
-  AttrSet r;
-
-  llvm::AttributeSet old = function->getAttributes();
+  auto old = function->getAttributes();
+#if LDC_LLVM_VER >= 500
+  return {LLAttributeSet::get(gIR->context(), old.getFnAttributes(),
+                              old.getRetAttributes(), {})};
+#else
   llvm::AttributeSet existingAttrs[] = {old.getFnAttributes(),
                                         old.getRetAttributes()};
-  r.set = llvm::AttributeSet::get(gIR->context(), existingAttrs);
-
-  return r;
+  return {LLAttributeSet::get(gIR->context(), existingAttrs)};
+#endif
 }
 
 AttrSet &AttrSet::add(unsigned index, const AttrBuilder &builder) {
   if (builder.hasAttributes()) {
-    auto as = llvm::AttributeSet::get(gIR->context(), index, builder);
+#if LDC_LLVM_VER >= 500
+    set = set.addAttributes(gIR->context(), index, builder);
+#else
+    auto as = LLAttributeSet::get(gIR->context(), index, builder);
     set = set.addAttributes(gIR->context(), index, as);
+#endif
   }
   return *this;
 }

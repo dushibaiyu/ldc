@@ -27,17 +27,14 @@
 # We also want an user-specified LLVM_ROOT_DIR to take precedence over the
 # system default locations such as /usr/local/bin. Executing find_program()
 # multiples times is the approach recommended in the docs.
-set(llvm_config_names llvm-config-4.1 llvm-config41
+set(llvm_config_names llvm-config-5.0 llvm-config50
                       llvm-config-4.0 llvm-config40
                       llvm-config-3.9 llvm-config39
                       llvm-config-3.8 llvm-config38
                       llvm-config-3.7 llvm-config37
                       llvm-config-3.6 llvm-config36
                       llvm-config-3.5 llvm-config35
-                      llvm-config-3.4 llvm-config34
-                      llvm-config-3.3 llvm-config33
-                      llvm-config-3.2 llvm-config32
-                      llvm-config-3.1 llvm-config31 llvm-config)
+                      llvm-config)
 find_program(LLVM_CONFIG
     NAMES ${llvm_config_names}
     PATHS ${LLVM_ROOT_DIR}/bin NO_DEFAULT_PATH
@@ -100,7 +97,7 @@ if ((WIN32 AND NOT(MINGW OR CYGWIN)) OR NOT LLVM_CONFIG)
             list(REMOVE_ITEM LLVM_FIND_COMPONENTS "debuginfocodeview" index)
             list(REMOVE_ITEM LLVM_FIND_COMPONENTS "globalisel" index)
         endif()
-        if(${LLVM_VERSION_STRING} MATCHES "^3\\.[8-9][\\.0-9A-Za-z]*")
+        if(NOT ${LLVM_VERSION_STRING} MATCHES "^3\\.[0-7][\\.0-9A-Za-z]*")
             # Versions beginning with 3.8 do not support component ipa
             list(REMOVE_ITEM LLVM_FIND_COMPONENTS "ipa" index)
         endif()
@@ -108,20 +105,16 @@ if ((WIN32 AND NOT(MINGW OR CYGWIN)) OR NOT LLVM_CONFIG)
             # Versions below 4.0 do not support component debuginfomsf
             list(REMOVE_ITEM LLVM_FIND_COMPONENTS "debuginfomsf" index)
         endif()
-        if(${LLVM_VERSION_STRING} MATCHES "^4\\.[\\.0-9A-Za-z]*")
-            # Versions beginning with 4. do not support component ipa
-            list(REMOVE_ITEM LLVM_FIND_COMPONENTS "ipa" index)
+        if(${LLVM_VERSION_STRING} MATCHES "^3\\.[0-6][\\.0-9A-Za-z]*")
+            # Versions below 3.7 do not support component libdriver
+            list(REMOVE_ITEM LLVM_FIND_COMPONENTS "libdriver" index)
         endif()
 
-        if(${LLVM_VERSION_STRING} MATCHES "^3\\.[0-4][\\.0-9A-Za-z]*")
-            llvm_map_components_to_libraries(tmplibs ${LLVM_FIND_COMPONENTS})
-        else()
-            llvm_map_components_to_libnames(tmplibs ${LLVM_FIND_COMPONENTS})
-        endif()
+        llvm_map_components_to_libnames(tmplibs ${LLVM_FIND_COMPONENTS})
         if(MSVC)
             set(LLVM_LDFLAGS "-LIBPATH:\"${LLVM_LIBRARY_DIRS}\"")
             foreach(lib ${tmplibs})
-                list(APPEND LLVM_LIBRARIES "${CMAKE_STATIC_LIBRARY_PREFIX}${lib}${CMAKE_STATIC_LIBRARY_SUFFIX}")
+                list(APPEND LLVM_LIBRARIES "${lib}.lib")
             endforeach()
         else()
             # Rely on the library search path being set correctly via -L on
@@ -138,7 +131,7 @@ if ((WIN32 AND NOT(MINGW OR CYGWIN)) OR NOT LLVM_CONFIG)
         string(REPLACE ";" " " LLVM_CXXFLAGS "${LLVM_CXXFLAGS}")
     else()
         if (NOT LLVM_FIND_QUIETLY)
-            message(WARNING "Could not find llvm-config. Try manually setting LLVM_CONFIG to the llvm-config executable of the installation to use.")
+            message(WARNING "Could not find llvm-config (LLVM >= ${LLVM_FIND_VERSION}). Try manually setting LLVM_CONFIG to the llvm-config executable of the installation to use.")
         endif()
     endif()
 else()
@@ -201,7 +194,7 @@ else()
         list(REMOVE_ITEM LLVM_FIND_COMPONENTS "debuginfocodeview" index)
         list(REMOVE_ITEM LLVM_FIND_COMPONENTS "globalisel" index)
     endif()
-    if(${LLVM_VERSION_STRING} MATCHES "^3\\.[8-9][\\.0-9A-Za-z]*")
+    if(NOT ${LLVM_VERSION_STRING} MATCHES "^3\\.[0-7][\\.0-9A-Za-z]*")
         # Versions beginning with 3.8 do not support component ipa
         list(REMOVE_ITEM LLVM_FIND_COMPONENTS "ipa" index)
     endif()
@@ -209,9 +202,9 @@ else()
         # Versions below 4.0 do not support component debuginfomsf
         list(REMOVE_ITEM LLVM_FIND_COMPONENTS "debuginfomsf" index)
     endif()
-    if(${LLVM_VERSION_STRING} MATCHES "^4\\.[\\.0-9A-Za-z]*")
-        # Versions beginning with 4. do not support component ipa
-        list(REMOVE_ITEM LLVM_FIND_COMPONENTS "ipa" index)
+    if(${LLVM_VERSION_STRING} MATCHES "^3\\.[0-6][\\.0-9A-Za-z]*")
+        # Versions below 3.7 do not support component libdriver
+        list(REMOVE_ITEM LLVM_FIND_COMPONENTS "libdriver" index)
     endif()
 
     llvm_set(LDFLAGS ldflags)
@@ -241,17 +234,20 @@ if(CMAKE_COMPILER_IS_GNUCXX OR (${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang"))
         set(LLVM_CXXFLAGS "${LLVM_CXXFLAGS} -fno-rtti")
     endif()
 endif()
+# GCC (at least on Travis) does not know the -Wstring-conversion flag, so remove it.
+if(CMAKE_COMPILER_IS_GNUCXX)
+    STRING(REGEX REPLACE "-Wstring-conversion" "" LLVM_CXXFLAGS ${LLVM_CXXFLAGS})
+endif()
 
 string(REGEX REPLACE "([0-9]+).*" "\\1" LLVM_VERSION_MAJOR "${LLVM_VERSION_STRING}" )
 string(REGEX REPLACE "[0-9]+\\.([0-9]+).*[A-Za-z]*" "\\1" LLVM_VERSION_MINOR "${LLVM_VERSION_STRING}" )
 
+if (${LLVM_VERSION_STRING} VERSION_LESS ${LLVM_FIND_VERSION})
+    message(FATAL_ERROR "Unsupported LLVM version found ${LLVM_VERSION_STRING}. At least version ${LLVM_FIND_VERSION} is required.")
+endif()
+
 # Use the default CMake facilities for handling QUIET/REQUIRED.
 include(FindPackageHandleStandardArgs)
-
-if(${CMAKE_VERSION} VERSION_LESS "2.8.4")
-  # The VERSION_VAR argument is not supported on pre-2.8.4, work around this.
-  set(VERSION_VAR dummy)
-endif()
 
 find_package_handle_standard_args(LLVM
     REQUIRED_VARS LLVM_ROOT_DIR LLVM_HOST_TARGET

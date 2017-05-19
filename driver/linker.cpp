@@ -11,6 +11,7 @@
 #include "mars.h"
 #include "module.h"
 #include "root.h"
+#include "driver/archiver.h"
 #include "driver/cl_options.h"
 #include "driver/exe_path.h"
 #include "driver/tool.h"
@@ -18,22 +19,15 @@
 #include "gen/llvm.h"
 #include "gen/logger.h"
 #include "gen/optimizer.h"
-#include "gen/programs.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/ProfileData/InstrProf.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/Program.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
-#if _WIN32
-#include "llvm/Support/SystemUtils.h"
-#include "llvm/Support/ConvertUTF.h"
-#include <Windows.h>
-#endif
 
 #include <algorithm>
 
@@ -45,17 +39,20 @@ static llvm::cl::opt<bool> staticFlag(
         "Create a statically linked binary, including all system dependencies"),
     llvm::cl::ZeroOrMore);
 
-// used by LDMD
-static llvm::cl::opt<bool> createStaticLibInObjdir(
-    "create-static-lib-in-objdir",
-    llvm::cl::desc("Create static library in -od directory (DMD-compliant)"),
-    llvm::cl::ZeroOrMore, llvm::cl::ReallyHidden);
-
-static llvm::cl::opt<std::string> ltoLibrary(
-    "flto-binary",
+static llvm::cl::opt<std::string> mscrtlib(
+    "mscrtlib",
     llvm::cl::desc(
-        "Set the path for LLVMgold.so (Unixes) or libLTO.dylib (Darwin)"),
-    llvm::cl::value_desc("file"));
+        "MS C runtime library to link against (libcmt[d] / msvcrt[d])"),
+    llvm::cl::value_desc("name"), llvm::cl::ZeroOrMore);
+
+static llvm::cl::opt<std::string>
+    ltoLibrary("flto-binary",
+               llvm::cl::desc("Set the linker LTO plugin library file (e.g. "
+                              "LLVMgold.so (Unixes) or libLTO.dylib (Darwin))"),
+               llvm::cl::value_desc("file"), llvm::cl::ZeroOrMore);
+
+static llvm::cl::opt<std::string> ar("ar", llvm::cl::desc("Archiver"),
+                                     llvm::cl::Hidden, llvm::cl::ZeroOrMore);
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -73,22 +70,29 @@ static void CreateDirectoryOnDisk(llvm::StringRef fileName) {
 //////////////////////////////////////////////////////////////////////////////
 
 static std::string getOutputName(bool const sharedLib) {
-  if (global.params.exefile)
-    return global.params.exefile;
+  const auto &triple = *global.params.targetTriple;
+
+  const char *extension = nullptr;
+  if (sharedLib) {
+    extension = global.dll_ext;
+  } else if (triple.isOSWindows()) {
+    extension = "exe";
+  }
+
+  if (global.params.exefile) {
+    // DMD adds the default extension if there is none
+    return opts::invokedByLDMD && extension
+               ? FileName::defaultExt(global.params.exefile, extension)
+               : global.params.exefile;
+  }
 
   // Infer output name from first object file.
   std::string result = global.params.objfiles->dim
                            ? FileName::removeExt((*global.params.objfiles)[0])
                            : "a.out";
 
-  const char *extension = nullptr;
-  if (sharedLib) {
-    extension = global.dll_ext;
-    if (!global.params.targetTriple->isWindowsMSVCEnvironment())
-      result = "lib" + result;
-  } else if (global.params.targetTriple->isOSWindows()) {
-    extension = "exe";
-  }
+  if (sharedLib && !triple.isWindowsMSVCEnvironment())
+    result = "lib" + result;
 
   if (global.params.run) {
     // If `-run` is passed, the executable is temporary and is removed
@@ -100,11 +104,9 @@ static std::string getOutputName(bool const sharedLib) {
                                                  tempFilename);
     if (!EC)
       result = tempFilename.str();
-  } else {
-    if (extension) {
-      result += ".";
-      result += extension;
-    }
+  } else if (extension) {
+    result += '.';
+    result += extension;
   }
 
   return result;
@@ -129,12 +131,23 @@ std::string getLTOGoldPluginPath() {
     fatal();
   } else {
     std::string searchPaths[] = {
-        exe_path::prependLibDir("LLVMgold.so"), "/usr/local/lib/LLVMgold.so",
-        "/usr/lib/bfd-plugins/LLVMgold.so",
+      // The plugin packaged with LDC has a "-ldc" suffix.
+      exe_path::prependLibDir("LLVMgold-ldc.so"),
+      // Perhaps the user copied the plugin to LDC's lib dir.
+      exe_path::prependLibDir("LLVMgold.so"),
+#if __LP64__
+      "/usr/local/lib64/LLVMgold.so",
+#endif
+      "/usr/local/lib/LLVMgold.so",
+#if __LP64__
+      "/usr/lib64/LLVMgold.so",
+#endif
+      "/usr/lib/LLVMgold.so",
+      "/usr/lib/bfd-plugins/LLVMgold.so",
     };
 
     // Try all searchPaths and early return upon the first path found.
-    for (auto p : searchPaths) {
+    for (const auto &p : searchPaths) {
       if (llvm::sys::fs::exists(p))
         return p;
     }
@@ -179,7 +192,8 @@ std::string getLTOdylibPath() {
     error(Loc(), "-flto-binary: '%s' not found", ltoLibrary.c_str());
     fatal();
   } else {
-    std::string searchPath = exe_path::prependLibDir("libLTO.dylib");
+    // The plugin packaged with LDC has a "-ldc" suffix.
+    std::string searchPath = exe_path::prependLibDir("libLTO-ldc.dylib");
     if (llvm::sys::fs::exists(searchPath))
       return searchPath;
 
@@ -272,11 +286,11 @@ static void appendObjectFiles(std::vector<std::string> &args) {
 
 static std::string gExePath;
 
-static int linkObjToBinaryGcc(bool sharedLib, bool fullyStatic) {
+static int linkObjToBinaryGcc(bool sharedLib) {
   Logger::println("*** Linking executable ***");
 
   // find gcc for linking
-  std::string gcc(getGcc());
+  const std::string tool = getGcc();
 
   // build arguments
   std::vector<std::string> args;
@@ -309,7 +323,7 @@ static int linkObjToBinaryGcc(bool sharedLib, bool fullyStatic) {
     args.push_back("-shared");
   }
 
-  if (fullyStatic) {
+  if (staticFlag) {
     args.push_back("-static");
   }
 
@@ -341,20 +355,38 @@ static int linkObjToBinaryGcc(bool sharedLib, bool fullyStatic) {
   if (opts::isUsingLTO())
     addLTOLinkFlags(args);
 
-  // additional linker switches
-  for (unsigned i = 0; i < global.params.linkswitches->dim; i++) {
-    const char *p = (*global.params.linkswitches)[i];
-    // Don't push -l and -L switches using -Xlinker, but pass them indirectly
-    // via GCC. This makes sure user-defined paths take precedence over
-    // GCC's builtin LIBRARY_PATHs.
-    // Options starting with -shared and -static are not handled by
-    // the linker and must be passed to the driver.
-    auto str = llvm::StringRef(p);
-    if (!(str.startswith("-l") || str.startswith("-L") ||
-          str.startswith("-shared") || str.startswith("-static"))) {
-      args.push_back("-Xlinker");
+  // additional linker and cc switches (preserve order across both lists)
+  for (unsigned ilink = 0, icc = 0;;) {
+    unsigned linkpos = ilink < opts::linkerSwitches.size()
+      ? opts::linkerSwitches.getPosition(ilink)
+      : std::numeric_limits<unsigned>::max();
+    unsigned ccpos = icc < opts::ccSwitches.size()
+      ? opts::ccSwitches.getPosition(icc)
+      : std::numeric_limits<unsigned>::max();
+    if (linkpos < ccpos) {
+      const std::string& p = opts::linkerSwitches[ilink++];
+      // Don't push -l and -L switches using -Xlinker, but pass them indirectly
+      // via GCC. This makes sure user-defined paths take precedence over
+      // GCC's builtin LIBRARY_PATHs.
+      // Options starting with `-Wl,`, -shared or -static are not handled by
+      // the linker and must be passed to the driver.
+      auto str = llvm::StringRef(p);
+      if (!(str.startswith("-l") || str.startswith("-L") ||
+            str.startswith("-Wl,") ||
+            str.startswith("-shared") || str.startswith("-static"))) {
+        args.push_back("-Xlinker");
+      }
+      args.push_back(p);
+    } else if (ccpos < linkpos) {
+      args.push_back(opts::ccSwitches[icc++]);
+    } else {
+      break;
     }
-    args.push_back(p);
+  }
+
+  // libs added via pragma(lib, libname)
+  for (unsigned i = 0; i < global.params.linkswitches->dim; i++) {
+    args.push_back((*global.params.linkswitches)[i]);
   }
 
   // default libs
@@ -475,212 +507,44 @@ static int linkObjToBinaryGcc(bool sharedLib, bool fullyStatic) {
   logstr << "\n"; // FIXME where's flush ?
 
   // try to call linker
-  return executeToolAndWait(gcc, args, global.params.verbose);
+  return executeToolAndWait(tool, args, global.params.verbose);
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
-#ifdef _WIN32
+static void addMscrtLibs(std::vector<std::string> &args) {
+  llvm::StringRef mscrtlibName = mscrtlib;
+  if (mscrtlibName.empty()) {
+    // default to static release variant
+    mscrtlibName =
+        staticFlag || staticFlag.getNumOccurrences() == 0 ? "libcmt" : "msvcrt";
+  }
 
-namespace windows {
-bool needsQuotes(const llvm::StringRef &arg) {
-  return // not already quoted
-      !(arg.size() > 1 && arg[0] == '"' &&
-        arg.back() == '"') && // empty or min 1 space or min 1 double quote
-      (arg.empty() || arg.find(' ') != arg.npos || arg.find('"') != arg.npos);
+  args.push_back(("/DEFAULTLIB:" + mscrtlibName).str());
+
+  const bool isStatic = mscrtlibName.startswith_lower("libcmt");
+  const bool isDebug =
+      mscrtlibName.endswith_lower("d") || mscrtlibName.endswith_lower("d.lib");
+
+  const llvm::StringRef prefix = isStatic ? "lib" : "";
+  const llvm::StringRef suffix = isDebug ? "d" : "";
+
+  args.push_back(("/DEFAULTLIB:" + prefix + "vcruntime" + suffix).str());
 }
-
-size_t countPrecedingBackslashes(const std::string &arg, size_t index) {
-  size_t count = 0;
-
-  for (size_t i = index - 1; i >= 0; --i) {
-    if (arg[i] != '\\')
-      break;
-    ++count;
-  }
-
-  return count;
-}
-
-std::string quoteArg(const std::string &arg) {
-  if (!needsQuotes(arg))
-    return arg;
-
-  std::string quotedArg;
-  quotedArg.reserve(3 + 2 * arg.size()); // worst case
-
-  quotedArg.push_back('"');
-
-  const size_t argLength = arg.length();
-  for (size_t i = 0; i < argLength; ++i) {
-    if (arg[i] == '"') {
-      // Escape all preceding backslashes (if any).
-      // Note that we *don't* need to escape runs of backslashes that don't
-      // precede a double quote! See MSDN:
-      // http://msdn.microsoft.com/en-us/library/17w5ykft%28v=vs.85%29.aspx
-      quotedArg.append(countPrecedingBackslashes(arg, i), '\\');
-
-      // Escape the double quote.
-      quotedArg.push_back('\\');
-    }
-
-    quotedArg.push_back(arg[i]);
-  }
-
-  // Make sure our final double quote doesn't get escaped by a trailing
-  // backslash.
-  quotedArg.append(countPrecedingBackslashes(arg, argLength), '\\');
-  quotedArg.push_back('"');
-
-  return quotedArg;
-}
-
-int executeAndWait(const char *commandLine) {
-  STARTUPINFO si;
-  ZeroMemory(&si, sizeof(si));
-  si.cb = sizeof(si);
-
-  PROCESS_INFORMATION pi;
-  ZeroMemory(&pi, sizeof(pi));
-
-  DWORD exitCode;
-
-#if UNICODE
-  std::wstring wcommandLine;
-  if (!llvm::ConvertUTF8toWide(commandLine, wcommandLine))
-    return -3;
-  auto cmdline = const_cast<wchar_t *>(wcommandLine.data());
-#else
-  auto cmdline = const_cast<char *>(commandLine);
-#endif
-  // according to MSDN, only CreateProcessW (unicode) may modify the passed
-  // command line
-  if (!CreateProcess(NULL, cmdline, NULL, NULL, TRUE, 0,
-                     NULL, NULL, &si, &pi)) {
-    exitCode = -1;
-  } else {
-    if (WaitForSingleObject(pi.hProcess, INFINITE) != 0 ||
-        !GetExitCodeProcess(pi.hProcess, &exitCode))
-      exitCode = -2;
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-  }
-
-  return exitCode;
-}
-}
-
-int executeMsvcToolAndWait(const std::string &tool,
-                           const std::vector<std::string> &args, bool verbose) {
-  llvm::SmallString<1024> commandLine; // full command line incl. executable
-
-  // if the VSINSTALLDIR environment variable is NOT set,
-  // the MSVC environment needs to be set up
-  const bool needMsvcSetup = !getenv("VSINSTALLDIR");
-  if (needMsvcSetup) {
-    /* <command line> => %ComSpec% /s /c "<batch file> <command line>"
-     *
-     * cmd.exe /c treats the following string argument (the command)
-     * in a very peculiar way if it starts with a double-quote.
-     * By adding /s and enclosing the command in extra double-quotes
-     * (WITHOUT additionally escaping the command), the command will
-     * be parsed properly.
-     */
-
-    auto comspecEnv = getenv("ComSpec");
-    if (!comspecEnv) {
-      warning(Loc(),
-              "'ComSpec' environment variable is not set, assuming 'cmd.exe'.");
-      comspecEnv = "cmd.exe";
-    }
-    std::string cmdExecutable = comspecEnv;
-    std::string batchFile = exe_path::prependBinDir(
-        global.params.targetTriple->isArch64Bit() ? "amd64.bat" : "x86.bat");
-
-    commandLine.append(windows::quoteArg(cmdExecutable));
-    commandLine.append(" /s /c \"");
-    commandLine.append(windows::quoteArg(batchFile));
-    commandLine.push_back(' ');
-    commandLine.append(windows::quoteArg(tool));
-  } else {
-    std::string toolPath = getProgram(tool.c_str());
-    commandLine.append(windows::quoteArg(toolPath));
-  }
-
-  const size_t commandLineLengthAfterTool = commandLine.size();
-
-  // append (quoted) args
-  for (size_t i = 0; i < args.size(); ++i) {
-    commandLine.push_back(' ');
-    commandLine.append(windows::quoteArg(args[i]));
-  }
-
-  const bool useResponseFile = (!args.empty() && commandLine.size() > 2000);
-  llvm::SmallString<128> responseFilePath;
-  if (useResponseFile) {
-    const size_t firstArgIndex = commandLineLengthAfterTool + 1;
-    llvm::StringRef content(commandLine.data() + firstArgIndex,
-                            commandLine.size() - firstArgIndex);
-
-    if (llvm::sys::fs::createTemporaryFile("ldc_link", "rsp",
-                                           responseFilePath) ||
-        llvm::sys::writeFileWithEncoding(
-            responseFilePath,
-            content)) // keep encoding (LLVM assumes UTF-8 input)
-    {
-      error(Loc(), "cannot write temporary response file for %s", tool.c_str());
-      return -1;
-    }
-
-    // replace all args by @<responseFilePath>
-    std::string responseFileArg = ("@" + responseFilePath).str();
-    commandLine.resize(firstArgIndex);
-    commandLine.append(windows::quoteArg(responseFileArg));
-  }
-
-  if (needMsvcSetup)
-    commandLine.push_back('"');
-
-  const char *finalCommandLine = commandLine.c_str();
-
-  if (verbose) {
-    fprintf(global.stdmsg, finalCommandLine);
-    fprintf(global.stdmsg, "\n");
-    fflush(global.stdmsg);
-  }
-
-  const int exitCode = windows::executeAndWait(finalCommandLine);
-
-  if (exitCode != 0) {
-    commandLine.resize(commandLineLengthAfterTool);
-    if (needMsvcSetup)
-      commandLine.push_back('"');
-    error(Loc(), "`%s` failed with status: %d", commandLine.c_str(), exitCode);
-  }
-
-  if (useResponseFile)
-    llvm::sys::fs::remove(responseFilePath);
-
-  return exitCode;
-}
-
-#else // !_WIN32
-
-int executeMsvcToolAndWait(const std::string &,
-                           const std::vector<std::string> &, bool) {
-  assert(0);
-  return -1;
-}
-
-#endif
-
-//////////////////////////////////////////////////////////////////////////////
 
 static int linkObjToBinaryMSVC(bool sharedLib) {
   Logger::println("*** Linking executable ***");
 
-  std::string tool = "link.exe";
+  if (!opts::ccSwitches.empty()) {
+    error(Loc(), "-Xcc is not supported for MSVC");
+    fatal();
+  }
+
+#ifdef _WIN32
+  windows::setupMsvcEnvironment();
+#endif
+
+  const std::string tool = "link.exe";
 
   // build arguments
   std::vector<std::string> args;
@@ -699,11 +563,6 @@ static int linkObjToBinaryMSVC(bool sharedLib) {
     args.push_back("/DEBUG");
   }
 
-  // enable Link-time Code Generation (aka. whole program optimization)
-  if (global.params.optimize) {
-    args.push_back("/LTCG");
-  }
-
   // remove dead code and fold identical COMDATs
   if (opts::disableLinkerStripDead) {
     args.push_back("/OPT:NOREF");
@@ -711,6 +570,9 @@ static int linkObjToBinaryMSVC(bool sharedLib) {
     args.push_back("/OPT:REF");
     args.push_back("/OPT:ICF");
   }
+
+  // add C runtime libs
+  addMscrtLibs(args);
 
   // specify creation of DLL
   if (sharedLib) {
@@ -744,8 +606,7 @@ static int linkObjToBinaryMSVC(bool sharedLib) {
   CreateDirectoryOnDisk(gExePath);
 
   // additional linker switches
-  for (unsigned i = 0; i < global.params.linkswitches->dim; i++) {
-    std::string str = global.params.linkswitches->data[i];
+  auto addSwitch = [&](std::string str) {
     if (str.length() > 2) {
       // rewrite common -L and -l switches
       if (str[0] == '-' && str[1] == 'L') {
@@ -755,6 +616,14 @@ static int linkObjToBinaryMSVC(bool sharedLib) {
       }
     }
     args.push_back(str);
+  };
+
+  for (const auto& str : opts::linkerSwitches) {
+    addSwitch(str);
+  }
+
+  for (unsigned i = 0; i < global.params.linkswitches->dim; i++) {
+    addSwitch(global.params.linkswitches->data[i]);
   }
 
   // default libs
@@ -781,18 +650,17 @@ static int linkObjToBinaryMSVC(bool sharedLib) {
   logstr << "\n"; // FIXME where's flush ?
 
   // try to call linker
-  return executeMsvcToolAndWait(tool, args, global.params.verbose);
+  return executeToolAndWait(tool, args, global.params.verbose);
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 int linkObjToBinary() {
   if (global.params.targetTriple->isWindowsMSVCEnvironment()) {
-    // TODO: Choose dynamic/static MSVCRT version based on staticFlag?
     return linkObjToBinaryMSVC(global.params.dll);
   }
 
-  return linkObjToBinaryGcc(global.params.dll, staticFlag);
+  return linkObjToBinaryGcc(global.params.dll);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -803,8 +671,24 @@ int createStaticLibrary() {
   const bool isTargetMSVC =
       global.params.targetTriple->isWindowsMSVCEnvironment();
 
+#if LDC_LLVM_VER >= 309
+  const bool useInternalArchiver = ar.empty();
+#else
+  const bool useInternalArchiver = false;
+#endif
+
   // find archiver
-  std::string tool(isTargetMSVC ? "lib.exe" : getArchiver());
+  std::string tool;
+  if (useInternalArchiver) {
+    tool = isTargetMSVC ? "llvm-lib.exe" : "llvm-ar";
+  } else {
+#ifdef _WIN32
+    if (isTargetMSVC)
+      windows::setupMsvcEnvironment();
+#endif
+
+    tool = getProgram(isTargetMSVC ? "lib.exe" : "ar", &ar);
+  }
 
   // build arguments
   std::vector<std::string> args;
@@ -819,23 +703,24 @@ int createStaticLibrary() {
     args.push_back("/NOLOGO");
   }
 
-  // enable Link-time Code Generation (aka. whole program optimization)
-  if (isTargetMSVC && global.params.optimize) {
-    args.push_back("/LTCG");
-  }
-
   // output filename
   std::string libName;
   if (global.params.libname) { // explicit
-    libName = global.params.libname;
+    // DMD adds the default extension if there is none
+    libName = opts::invokedByLDMD
+                  ? FileName::defaultExt(global.params.libname, global.lib_ext)
+                  : global.params.libname;
   } else { // infer from first object file
     libName = global.params.objfiles->dim
                   ? FileName::removeExt((*global.params.objfiles)[0])
                   : "a.out";
-    libName.push_back('.');
-    libName.append(global.lib_ext);
+    libName += '.';
+    libName += global.lib_ext;
   }
-  if (createStaticLibInObjdir && global.params.objdir &&
+
+  // DMD creates static libraries in the objects directory (unless using an
+  // absolute output path via `-of`).
+  if (opts::invokedByLDMD && global.params.objdir &&
       !FileName::absolute(libName.c_str())) {
     libName = FileName::combine(global.params.objdir, libName.c_str());
   }
@@ -851,14 +736,32 @@ int createStaticLibrary() {
   // create path to the library
   CreateDirectoryOnDisk(libName);
 
-  // try to call archiver
-  int exitCode;
-  if (isTargetMSVC) {
-    exitCode = executeMsvcToolAndWait(tool, args, global.params.verbose);
-  } else {
-    exitCode = executeToolAndWait(tool, args, global.params.verbose);
+#if LDC_LLVM_VER >= 309
+  if (useInternalArchiver) {
+    std::vector<const char *> fullArgs;
+    fullArgs.reserve(1 + args.size());
+    fullArgs.push_back(tool.c_str());
+    for (const auto &arg : args)
+      fullArgs.push_back(arg.c_str());
+
+    if (global.params.verbose) {
+      for (auto arg : fullArgs) {
+        fprintf(global.stdmsg, "%s ", arg);
+      }
+      fprintf(global.stdmsg, "\n");
+      fflush(global.stdmsg);
+    }
+
+    const int exitCode = isTargetMSVC ? ldc::lib(fullArgs) : ldc::ar(fullArgs);
+    if (exitCode)
+      error(Loc(), "%s failed with status: %d", tool.c_str(), exitCode);
+
+    return exitCode;
   }
-  return exitCode;
+#endif
+
+  // try to call archiver
+  return executeToolAndWait(tool, args, global.params.verbose);
 }
 
 //////////////////////////////////////////////////////////////////////////////

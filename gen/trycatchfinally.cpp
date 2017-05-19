@@ -256,11 +256,10 @@ void TryCatchScope::emitCatchBodiesMSVC(IRState &irs, llvm::Value *) {
   // if no landing pad is created, the catch blocks are unused, but
   // the verifier complains if there are catchpads without personality
   // so we can just set it unconditionally
-  if (!irs.func()->func->hasPersonalityFn()) {
+  if (!irs.func()->hasLLVMPersonalityFn()) {
     const char *personality = "__CxxFrameHandler3";
-    LLFunction *personalityFn =
-        getRuntimeFunction(Loc(), irs.module, personality);
-    irs.func()->func->setPersonalityFn(personalityFn);
+    irs.func()->setLLVMPersonalityFn(
+        getRuntimeFunction(Loc(), irs.module, personality));
   }
 }
 
@@ -307,6 +306,9 @@ llvm::BasicBlock *CleanupScope::run(IRState &irs, llvm::BasicBlock *sourceBlock,
   if (!branchSelector) {
     // ... and have not created one yet, so do so now.
     branchSelector = new llvm::AllocaInst(llvm::Type::getInt32Ty(irs.context()),
+#if LDC_LLVM_VER >= 500
+                                          irs.module.getDataLayout().getAllocaAddrSpace(),
+#endif
                                           llvm::Twine("branchsel.") +
                                               beginBlock()->getName(),
                                           irs.topallocapoint());
@@ -618,16 +620,18 @@ TryCatchFinallyScopes::getLandingPadRef(CleanupCursor scope) {
 }
 
 namespace {
-llvm::LandingPadInst *createLandingPadInst(IRState &irs) {
-  LLType *retType =
+  llvm::LandingPadInst *createLandingPadInst(IRState &irs) {
+    LLType *retType =
       LLStructType::get(LLType::getInt8PtrTy(irs.context()),
-                        LLType::getInt32Ty(irs.context()), nullptr);
+        LLType::getInt32Ty(irs.context())
+#if LDC_LLVM_VER < 500
+        , nullptr
+#endif
+      );
 #if LDC_LLVM_VER >= 307
-  LLFunction *currentFunction = irs.func()->func;
-  if (!currentFunction->hasPersonalityFn()) {
-    LLFunction *personalityFn =
-        getRuntimeFunction(Loc(), irs.module, "_d_eh_personality");
-    currentFunction->setPersonalityFn(personalityFn);
+  if (!irs.func()->hasLLVMPersonalityFn()) {
+    irs.func()->setLLVMPersonalityFn(
+        getRuntimeFunction(Loc(), irs.module, "_d_eh_personality"));
   }
   return irs.ir->CreateLandingPad(retType, 0);
 #else
@@ -753,12 +757,10 @@ llvm::BasicBlock *TryCatchFinallyScopes::getOrCreateResumeUnwindBlock() {
 #if LDC_LLVM_VER >= 308
 llvm::BasicBlock *
 TryCatchFinallyScopes::emitLandingPadMSVC(CleanupCursor cleanupScope) {
-  LLFunction *currentFunction = irs.func()->func;
-  if (!currentFunction->hasPersonalityFn()) {
+  if (!irs.func()->hasLLVMPersonalityFn()) {
     const char *personality = "__CxxFrameHandler3";
-    LLFunction *personalityFn =
-        getRuntimeFunction(Loc(), irs.module, personality);
-    currentFunction->setPersonalityFn(personalityFn);
+    irs.func()->setLLVMPersonalityFn(
+        getRuntimeFunction(Loc(), irs.module, personality));
   }
 
   if (cleanupScope == 0)
